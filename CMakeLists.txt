@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
-project(VoiceMultiplier VERSION 1.0.0)
+project(VoiceMultiplier VERSION 1.1.0)
+
+option(VM_BUILD_TESTS "Build the JUCE-independent DSP unit tests" OFF)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,6 +33,8 @@ juce_add_plugin(VoiceMultiplier
     PLUGIN_MANUFACTURER_CODE  "YrCo"
     PLUGIN_CODE               "VcMl"
     FORMATS                   VST3
+    PRODUCT_NAME              "VoiceMultiplier"
+    VST3_CATEGORIES           Fx Pitch Shift
 )
 
 # REQUIRED: generates JuceHeader.h in the build directory
@@ -48,11 +52,13 @@ target_compile_definitions(VoiceMultiplier PUBLIC
     JUCE_DISPLAY_SPLASH_SCREEN=0
 )
 
-# Silence noisy warnings from JUCE internals and our int->size_t casts
-target_compile_options(VoiceMultiplier PRIVATE
-    -Wno-sign-conversion
-    -Wno-array-bounds
-)
+# Silence noisy warnings from JUCE internals (GCC / Clang only, MSVC rejects these flags)
+if(NOT MSVC)
+    target_compile_options(VoiceMultiplier PRIVATE
+        -Wno-sign-conversion
+        -Wno-array-bounds
+    )
+endif()
 
 target_link_libraries(VoiceMultiplier PRIVATE
     juce::juce_audio_utils
@@ -63,3 +69,16 @@ target_link_libraries(VoiceMultiplier PRIVATE
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags
 )
+
+# ---------------------------------------------------------------
+# Optional: plain C++ unit tests for Source/Dsp.h (no JUCE needed)
+#   cmake -B build -DVM_BUILD_TESTS=ON && cmake --build build
+#   ctest --test-dir build -C Release --output-on-failure
+# ---------------------------------------------------------------
+if(VM_BUILD_TESTS)
+    enable_testing()
+    add_executable(DspTests Tests/DspTests.cpp)
+    target_include_directories(DspTests PRIVATE Source)
+    target_compile_features(DspTests PRIVATE cxx_std_17)
+    add_test(NAME DspTests COMMAND DspTests)
+endif()

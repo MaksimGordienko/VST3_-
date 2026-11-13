@@ -1,100 +1,16 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
-// ============================================================
-// YIN pitch detector implementation
-// ============================================================
-void YinPitchDetector::prepare (double sr, int minSize)
+namespace
 {
-    sampleRate = sr;
-    bufferSize = juce::jmax (2048, juce::nextPowerOfTwo (minSize));
-    buffer.assign  (static_cast<size_t> (bufferSize), 0.0f);
-    ordered.resize (static_cast<size_t> (bufferSize));
-    minPeriod = juce::jmax (2, static_cast<int> (std::floor (sr / 1000.0)));
-    maxPeriod = juce::jmin (bufferSize / 2 - 1,
-                            static_cast<int> (std::ceil (sr / 60.0)));
-    diff.resize     (static_cast<size_t> (maxPeriod + 2));
-    diffNorm.resize (static_cast<size_t> (maxPeriod + 2));
-    writePos = 0;
-}
-
-void YinPitchDetector::pushSamples (const float* data, int n)
-{
-    for (int i = 0; i < n; ++i)
-    {
-        buffer[static_cast<size_t> (writePos)] = data[i];
-        writePos = (writePos + 1) % bufferSize;
-    }
-}
-
-void YinPitchDetector::reset()
-{
-    std::fill (buffer.begin(), buffer.end(), 0.0f);
-    writePos = 0;
-}
-
-float YinPitchDetector::detect()
-{
-    const int N = bufferSize;
-    const int W = N / 2;
-
-    for (int i = 0; i < N; ++i)
-        ordered[static_cast<size_t> (i)] =
-            buffer[static_cast<size_t> ((writePos + i) % N)];
-
-    for (int tau = 1; tau <= maxPeriod; ++tau)
-    {
-        float sum = 0.0f;
-        for (int j = 0; j < W; ++j)
-        {
-            const float d = ordered[static_cast<size_t> (j)]
-                          - ordered[static_cast<size_t> (j + tau)];
-            sum += d * d;
-        }
-        diff[static_cast<size_t> (tau)] = sum;
-    }
-
-    diffNorm[0] = 1.0f;
-    float running = 0.0f;
-    for (int tau = 1; tau <= maxPeriod; ++tau)
-    {
-        running += diff[static_cast<size_t> (tau)];
-        diffNorm[static_cast<size_t> (tau)] =
-            running > 1e-10f
-                ? (diff[static_cast<size_t> (tau)] * static_cast<float> (tau) / running)
-                : 1.0f;
-    }
-
-    int tauEst = -1;
-    for (int tau = minPeriod; tau <= maxPeriod; ++tau)
-    {
-        if (diffNorm[static_cast<size_t> (tau)] < threshold)
-        {
-            while (tau + 1 <= maxPeriod
-                   && diffNorm[static_cast<size_t> (tau + 1)]
-                      < diffNorm[static_cast<size_t> (tau)])
-                ++tau;
-            tauEst = tau;
-            break;
-        }
-    }
-    if (tauEst < 0) return 0.0f;
-
-    float betterTau = static_cast<float> (tauEst);
-    if (tauEst > 0 && tauEst < maxPeriod)
-    {
-        const float s0 = diffNorm[static_cast<size_t> (tauEst - 1)];
-        const float s1 = diffNorm[static_cast<size_t> (tauEst)];
-        const float s2 = diffNorm[static_cast<size_t> (tauEst + 1)];
-        const float denom = 2.0f * (2.0f * s1 - s2 - s0);
-        if (std::abs (denom) > 1e-10f)
-            betterTau = static_cast<float> (tauEst) + (s2 - s0) / denom;
-    }
-    return static_cast<float> (sampleRate / betterTau);
+constexpr float kMinPitchHz = 20.0f;
+constexpr float kMaxPitchHz = 2000.0f;
+constexpr double kMaxVoiceDelaySeconds = 0.030;   // upper end of the "Voice Delay" parameter
+constexpr double kPitchHoldSeconds     = 0.4;     // keep the last pitch while the singer is unvoiced
 }
 
 // ============================================================
-// Processor implementation
+// Construction / parameters
 // ============================================================
 VoiceMultiplierProcessor::VoiceMultiplierProcessor()
     : AudioProcessor (BusesProperties()
@@ -102,127 +18,189 @@ VoiceMultiplierProcessor::VoiceMultiplierProcessor()
         .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "Parameters", createParameters())
 {
+    voicesParam = apvts.getRawParameterValue ("voices");
+    detuneParam = apvts.getRawParameterValue ("detune");
+    delayParam  = apvts.getRawParameterValue ("delay");
+    widthParam  = apvts.getRawParameterValue ("width");
+    dryWetParam = apvts.getRawParameterValue ("dryWet");
+
+    for (auto& w : heldNotes)
+        w.store (0);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout
 VoiceMultiplierProcessor::createParameters()
 {
+    using PID = juce::ParameterID;
+    using FloatAttrs = juce::AudioParameterFloatAttributes;
+
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
-    layout.add (std::make_unique<juce::AudioParameterInt>(
-        "voices", "Max Polyphony", 1, kMaxVoices, 4));
+    layout.add (std::make_unique<juce::AudioParameterInt> (
+        PID { "voices", 1 }, "Max Polyphony", 1, kMaxVoices, 4));
 
-    layout.add (std::make_unique<juce::AudioParameterFloat>(
-        "detune", "Detune (cents)", 0.0f, 30.0f, 5.0f));
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        PID { "detune", 1 }, "Detune (cents)",
+        juce::NormalisableRange<float> (0.0f, 30.0f, 0.1f), 5.0f,
+        FloatAttrs()
+            .withStringFromValueFunction ([] (float v, int) { return juce::String (v, 1) + " ct"; })
+            .withValueFromStringFunction ([] (const juce::String& t) { return t.getFloatValue(); })));
 
-    layout.add (std::make_unique<juce::AudioParameterFloat>(
-        "delay", "Voice Delay (ms)", 0.0f, 30.0f, 8.0f));
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        PID { "delay", 1 }, "Voice Delay (ms)",
+        juce::NormalisableRange<float> (0.0f, 30.0f, 0.1f), 8.0f,
+        FloatAttrs()
+            .withStringFromValueFunction ([] (float v, int) { return juce::String (v, 1) + " ms"; })
+            .withValueFromStringFunction ([] (const juce::String& t) { return t.getFloatValue(); })));
 
-    layout.add (std::make_unique<juce::AudioParameterFloat>(
-        "width", "Stereo Width", 0.0f, 1.0f, 0.8f));
+    auto percent = FloatAttrs()
+        .withStringFromValueFunction ([] (float v, int) { return juce::String (juce::roundToInt (v * 100.0f)) + " %"; })
+        .withValueFromStringFunction ([] (const juce::String& t) { return t.getFloatValue() / 100.0f; });
 
-    layout.add (std::make_unique<juce::AudioParameterFloat>(
-        "dryWet", "Dry/Wet", 0.0f, 1.0f, 0.8f));
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        PID { "width", 1 }, "Stereo Width",
+        juce::NormalisableRange<float> (0.0f, 1.0f, 0.01f), 0.8f, percent));
+
+    layout.add (std::make_unique<juce::AudioParameterFloat> (
+        PID { "dryWet", 1 }, "Dry/Wet",
+        juce::NormalisableRange<float> (0.0f, 1.0f, 0.01f), 0.8f, percent));
 
     return layout;
+}
+
+// ============================================================
+// Lifecycle
+// ============================================================
+void VoiceMultiplierProcessor::allocateScratch (int numSamples)
+{
+    const auto n = static_cast<size_t> (juce::jmax (1, numSamples));
+    monoScratch.assign (n, 0.0f);
+    pitchedScratch.assign (n, 0.0f);
+    wetL.assign (n, 0.0f);
+    wetR.assign (n, 0.0f);
+    normRamp.assign (n, 1.0f);
+    mixRamp.assign (n, 0.0f);
+    scratchCapacity = static_cast<int> (n);
 }
 
 void VoiceMultiplierProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     currentSampleRate = sampleRate;
-    const int delayLineSize = static_cast<int> (0.05 * sampleRate);
+    allocateScratch (juce::jmax (samplesPerBlock, 512));
+
+    const int delayLineSize = static_cast<int> (std::ceil (kMaxVoiceDelaySeconds * sampleRate)) + 8;
 
     for (auto& v : voices)
     {
-        v.shifter = std::make_unique<SimplePitchShifter>();
-        v.shifter->prepare (sampleRate, samplesPerBlock);
-        v.shifter->reset();
+        v.shifter.prepare (sampleRate);
         v.delayLine.assign (static_cast<size_t> (delayLineSize), 0.0f);
-        v.writePos      = 0;
-        v.midiNote      = -1;
-        v.targetGain    = 0.0f;
-        v.currentGain   = 0.0f;
-        v.delaySamples  = 0;
+        v.writePos     = 0;
+        v.midiNote     = -1;
+        v.targetGain   = 0.0f;
+        v.currentGain  = 0.0f;
+        v.needsInit    = true;
+        v.ratio        = 1.0f;
+        v.delaySamples = 0.0f;
     }
 
-    pitchDetector.prepare (sampleRate, 2048);
+    // The pitch shifter has a fixed latency; the dry signal is delayed by the
+    // same amount and the host is told about it (plugin delay compensation).
+    const int latency = vm::SimplePitchShifter::latencyFor (sampleRate);
+    for (auto& d : dryDelay)
+        d.prepare (latency);
+    setLatencySamples (latency);
+
+    pitchDetector.prepare (sampleRate);
     pitchDetector.reset();
+    pitchDetectInterval = pitchDetector.getRecommendedInterval();
+    pitchDetectCounter  = 0;
     pitchHistory.fill (0.0f);
-    pitchHistCount = 0;
-    pitchHistIdx   = 0;
+    pitchHistCount  = 0;
+    pitchHistIdx    = 0;
     smoothedPitchHz = 0.0f;
-    pitchDetectCounter = 0;
+    unvoicedSamples = 0;
+
+    smoothedNorm   = 1.0f;
+    smoothedWetMix = 0.0f;
+
+    detectedPitchHz.store (0.0f);
+    activeVoiceCount.store (0);
+    for (auto& w : heldNotes)
+        w.store (0);
 }
 
 void VoiceMultiplierProcessor::releaseResources() {}
 
 bool VoiceMultiplierProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
-    return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo()
-        && layouts.getMainInputChannelSet()  == juce::AudioChannelSet::stereo();
+    // A microphone is usually a mono track, so accept mono or stereo on both sides.
+    const auto& in  = layouts.getMainInputChannelSet();
+    const auto& out = layouts.getMainOutputChannelSet();
+
+    const bool inOk  = in  == juce::AudioChannelSet::mono() || in  == juce::AudioChannelSet::stereo();
+    const bool outOk = out == juce::AudioChannelSet::mono() || out == juce::AudioChannelSet::stereo();
+    return inOk && outOk;
 }
 
-void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
-                                             juce::MidiBuffer& midiMessages)
+// ============================================================
+// Helpers
+// ============================================================
+void VoiceMultiplierProcessor::setNoteHeld (int note, bool held) noexcept
 {
-    juce::ScopedNoDenormals noDenormals;
-    const int numSamples  = buffer.getNumSamples();
-    const int numChannels = buffer.getNumChannels();
-    if (numChannels < 1) return;
+    if (note < 0 || note > 127) return;
+    auto& word = heldNotes[static_cast<size_t> (note >> 6)];
+    const uint64_t bit = uint64_t { 1 } << (note & 63);
+    if (held) word.fetch_or (bit);
+    else      word.fetch_and (~bit);
+}
 
-    const int   maxVoices   = juce::jlimit (1, kMaxVoices,
-                                  static_cast<int> (*apvts.getRawParameterValue ("voices")));
-    const float detuneCents = apvts.getRawParameterValue ("detune")->load();
-    const float maxDelayMs  = apvts.getRawParameterValue ("delay")->load();
-    const float width       = apvts.getRawParameterValue ("width")->load();
-    const float dryWet      = apvts.getRawParameterValue ("dryWet")->load();
+void VoiceMultiplierProcessor::updatePitchEstimate()
+{
+    const float detected = pitchDetector.detect();
+    const bool  voiced   = detected > kMinPitchHz && detected < kMaxPitchHz;
+    detectedPitchHz.store (voiced ? detected : 0.0f);
 
-    // --- Mono input ---
-    juce::AudioBuffer<float> monoIn (1, numSamples);
+    if (voiced)
     {
-        auto* m = monoIn.getWritePointer (0);
-        const auto* L = buffer.getReadPointer (0);
-        const auto* R = buffer.getReadPointer (numChannels > 1 ? 1 : 0);
-        if (numChannels > 1)
-            for (int i = 0; i < numSamples; ++i) m[i] = 0.5f * (L[i] + R[i]);
-        else
-            for (int i = 0; i < numSamples; ++i) m[i] = L[i];
+        unvoicedSamples = 0;
+
+        pitchHistory[static_cast<size_t> (pitchHistIdx)] = detected;
+        pitchHistIdx = (pitchHistIdx + 1) % static_cast<int> (pitchHistory.size());
+        if (pitchHistCount < static_cast<int> (pitchHistory.size()))
+            ++pitchHistCount;
+
+        // Median of the last few estimates rejects octave errors / outliers
+        auto sorted = pitchHistory;
+        std::sort (sorted.begin(), sorted.begin() + pitchHistCount);
+        smoothedPitchHz = sorted[static_cast<size_t> (pitchHistCount / 2)];
     }
-
-    // --- Pitch detection ---
-    pitchDetector.pushSamples (monoIn.getReadPointer (0), numSamples);
-    pitchDetectCounter += numSamples;
-    if (pitchDetectCounter >= kPitchDetectInterval)
+    else
     {
-        pitchDetectCounter = 0;
-        const float detected = pitchDetector.detect();
-        detectedPitchHz.store (detected > 0 ? detected : 0.0f);
-
-        if (detected > 20.0f && detected < 2000.0f)
+        // Hold the last pitch through short unvoiced gaps (consonants, breaths),
+        // then forget it so the next phrase starts with a clean history.
+        unvoicedSamples += pitchDetectInterval;
+        if (unvoicedSamples > static_cast<int> (kPitchHoldSeconds * currentSampleRate))
         {
-            pitchHistory[static_cast<size_t> (pitchHistIdx)] = detected;
-            pitchHistIdx = (pitchHistIdx + 1) % static_cast<int> (pitchHistory.size());
-            if (pitchHistCount < static_cast<int> (pitchHistory.size())) ++pitchHistCount;
-
-            std::array<float, 5> temp;
-            std::copy (pitchHistory.begin(), pitchHistory.end(), temp.begin());
-            std::sort (temp.begin(), temp.begin() + pitchHistCount);
-            smoothedPitchHz = temp[static_cast<size_t> (pitchHistCount / 2)];
-        }
-        else
-        {
-            smoothedPitchHz *= 0.9f;
+            smoothedPitchHz = 0.0f;
+            pitchHistCount  = 0;
+            pitchHistIdx    = 0;
+            pitchHistory.fill (0.0f);
         }
     }
+}
 
-    // --- MIDI handling ---
-    for (const auto meta : midiMessages)
+void VoiceMultiplierProcessor::handleMidi (const juce::MidiBuffer& midi, int maxVoices)
+{
+    for (const auto meta : midi)
     {
         const auto msg = meta.getMessage();
+
         if (msg.isNoteOn())
         {
             const int note = msg.getNoteNumber();
+            setNoteHeld (note, true);
 
+            // Re-trigger of a note that is already sounding / releasing
             int existing = -1;
             for (int i = 0; i < kMaxVoices; ++i)
                 if (voices[static_cast<size_t> (i)].midiNote == note)
@@ -235,8 +213,8 @@ void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             }
 
             int activeCount = 0;
-            for (int i = 0; i < kMaxVoices; ++i)
-                if (voices[static_cast<size_t> (i)].midiNote >= 0) ++activeCount;
+            for (const auto& v : voices)
+                if (v.midiNote >= 0) ++activeCount;
 
             int slot = -1;
             if (activeCount < maxVoices)
@@ -244,12 +222,12 @@ void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                     if (voices[static_cast<size_t> (i)].midiNote < 0)
                         { slot = i; break; }
 
-            if (slot < 0)  // voice stealing
+            if (slot < 0)  // voice stealing: prefer releasing voices, then the quietest one
             {
                 float lowest = 2.0f;
                 for (int i = 0; i < kMaxVoices; ++i)
                 {
-                    auto& v = voices[static_cast<size_t> (i)];
+                    const auto& v = voices[static_cast<size_t> (i)];
                     if (v.targetGain < 0.001f && v.currentGain < lowest)
                         { lowest = v.currentGain; slot = i; }
                 }
@@ -258,7 +236,7 @@ void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                     lowest = 2.0f;
                     for (int i = 0; i < kMaxVoices; ++i)
                     {
-                        auto& v = voices[static_cast<size_t> (i)];
+                        const auto& v = voices[static_cast<size_t> (i)];
                         if (v.currentGain < lowest)
                             { lowest = v.currentGain; slot = i; }
                     }
@@ -268,10 +246,14 @@ void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             if (slot >= 0)
             {
                 auto& v = voices[static_cast<size_t> (slot)];
+                if (v.midiNote >= 0 && v.midiNote != note)
+                    setNoteHeld (v.midiNote, false);   // stolen voice
+
                 v.midiNote    = note;
                 v.targetGain  = 1.0f;
                 v.currentGain = 0.0f;
-                v.shifter->reset();
+                v.needsInit   = true;
+                v.shifter.reset();
                 std::fill (v.delayLine.begin(), v.delayLine.end(), 0.0f);
                 v.writePos = 0;
             }
@@ -279,102 +261,223 @@ void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         else if (msg.isNoteOff())
         {
             const int note = msg.getNoteNumber();
-            for (int i = 0; i < kMaxVoices; ++i)
-                if (voices[static_cast<size_t> (i)].midiNote == note)
-                    voices[static_cast<size_t> (i)].targetGain = 0.0f;
+            setNoteHeld (note, false);
+            for (auto& v : voices)
+                if (v.midiNote == note)
+                    v.targetGain = 0.0f;
         }
         else if (msg.isAllNotesOff() || msg.isAllSoundOff())
         {
             for (auto& v : voices) v.targetGain = 0.0f;
+            for (auto& w : heldNotes) w.store (0);
         }
     }
+}
 
-    int activeCount = 0;
-    for (int i = 0; i < kMaxVoices; ++i)
+// ============================================================
+// Audio
+// ============================================================
+void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
+                                             juce::MidiBuffer& midiMessages)
+{
+    juce::ScopedNoDenormals noDenormals;
+
+    const int numSamples = buffer.getNumSamples();
+    const int numIn      = juce::jmin (2, getTotalNumInputChannels());
+    const int numOut     = juce::jmin (2, getTotalNumOutputChannels());
+
+    if (numSamples <= 0 || numIn < 1 || numOut < 1 || buffer.getNumChannels() < 1)
     {
-        auto& v = voices[static_cast<size_t> (i)];
-        if (v.midiNote >= 0 || v.currentGain > 0.001f) ++activeCount;
-    }
-
-    juce::AudioBuffer<float> dry;
-    dry.makeCopyOf (buffer);
-    buffer.clear();
-
-    if (activeCount == 0 || smoothedPitchHz < 20.0f)
-    {
-        for (int ch = 0; ch < numChannels; ++ch)
-            buffer.copyFrom (ch, 0, dry, ch, 0, numSamples);
+        buffer.clear();
         return;
     }
 
-    const float smoothCoeff = 1.0f - std::exp (-1.0f / (float) (currentSampleRate * 0.01));
-    const float voiceGain   = 1.0f / std::sqrt (static_cast<float> (activeCount));
+    // Only reallocates if the host exceeds the block size it announced.
+    if (numSamples > scratchCapacity)
+        allocateScratch (numSamples);
 
-    int processedCount = 0;
-    for (int v = 0; v < kMaxVoices; ++v)
+    const int   maxVoices   = juce::jlimit (1, kMaxVoices, juce::roundToInt (voicesParam->load()));
+    const float detuneCents = detuneParam->load();
+    const float maxDelayMs  = delayParam->load();
+    const float width       = widthParam->load();
+    const float dryWet      = dryWetParam->load();
+
+    float* ch0 = buffer.getWritePointer (0);
+    float* ch1 = buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : nullptr;
+    const bool stereoIn = numIn > 1 && ch1 != nullptr;
+    const bool stereoOut = numOut > 1 && ch1 != nullptr;
+
+    // --- Mono sum of the input ---
+    float* mono = monoScratch.data();
+    for (int i = 0; i < numSamples; ++i)
+        mono[i] = stereoIn ? 0.5f * (ch0[i] + ch1[i]) : ch0[i];
+
+    // --- Pitch detection ---
+    pitchDetector.pushSamples (mono, numSamples);
+    pitchDetectCounter += numSamples;
+    if (pitchDetectCounter >= pitchDetectInterval)
     {
-        auto& voice = voices[static_cast<size_t> (v)];
-        if (voice.midiNote < 0 && voice.currentGain < 0.001f) continue;
+        pitchDetectCounter = 0;
+        updatePitchEstimate();
+    }
 
-        const float targetHz = 440.0f * std::pow (2.0f, (voice.midiNote - 69) / 12.0f);
-        const float detuneRatio = std::pow (2.0f, detuneCents / 1200.0f);
-        const float ratio = juce::jlimit (0.25f, 4.0f,
-                                          (targetHz / smoothedPitchHz) * detuneRatio);
-        voice.shifter->setShiftRatio (ratio);
+    // --- MIDI ---
+    handleMidi (midiMessages, maxVoices);
 
-        juce::AudioBuffer<float> pitched (1, numSamples);
-        pitched.makeCopyOf (monoIn);
-        voice.shifter->process (pitched);
+    int activeCount = 0;
+    for (const auto& v : voices)
+        if (v.midiNote >= 0) ++activeCount;
+    activeVoiceCount.store (activeCount);
 
-        const int targetDelay = (activeCount > 1)
-            ? static_cast<int> (maxDelayMs * 0.001 * currentSampleRate
-                                * static_cast<float> (processedCount)
-                                / static_cast<float> (activeCount - 1))
-            : 0;
-        voice.delaySamples = targetDelay;
+    // --- Per-sample global ramps (voice-count normalisation, wet mix) ---
+    const float sr          = static_cast<float> (currentSampleRate);
+    const float smoothCoeff = 1.0f - std::exp (-1.0f / (sr * 0.01f));
+    const float normTarget  = 1.0f / std::sqrt (static_cast<float> (juce::jmax (1, activeCount)));
+    const float mixTarget   = activeCount > 0 ? dryWet : 0.0f;   // no notes held = clean bypass
 
-        const float pan = (activeCount <= 1) ? 0.0f
-            : juce::jmap (static_cast<float> (processedCount), 0.0f,
-                          static_cast<float> (activeCount - 1), -width, width);
-        const float panL = std::sqrt (0.5f * (1.0f - pan));
-        const float panR = std::sqrt (0.5f * (1.0f + pan));
+    for (int i = 0; i < numSamples; ++i)
+    {
+        smoothedNorm   += (normTarget - smoothedNorm)   * smoothCoeff;
+        smoothedWetMix += (mixTarget  - smoothedWetMix) * smoothCoeff;
+        normRamp[static_cast<size_t> (i)] = smoothedNorm;
+        mixRamp[static_cast<size_t> (i)]  = smoothedWetMix;
+    }
 
-        auto* outL = buffer.getWritePointer (0);
-        auto* outR = buffer.getWritePointer (numChannels > 1 ? 1 : 0);
-        const auto* src = pitched.getReadPointer (0);
+    // --- Voices ---
+    float* wl = wetL.data();
+    float* wr = wetR.data();
+    std::fill_n (wl, numSamples, 0.0f);
+    std::fill_n (wr, numSamples, 0.0f);
+
+    const float n          = static_cast<float> (numSamples);
+    const float ratioCoeff = 1.0f - std::exp (-n / (sr * 0.03f));
+    const float panCoeff   = 1.0f - std::exp (-n / (sr * 0.05f));
+    const float maxDelaySamples = maxDelayMs * 0.001f * sr;
+    const float* ramp = normRamp.data();
+    float* pitched = pitchedScratch.data();
+
+    int processed = 0;
+    for (auto& voice : voices)
+    {
+        if (voice.midiNote < 0)
+            continue;
+
+        // Position of this voice inside the chord: -1 .. +1 (used for detune, pan, delay)
+        const float position = activeCount > 1
+            ? static_cast<float> (processed) / static_cast<float> (activeCount - 1)
+            : 0.5f;
+        const float spread = position * 2.0f - 1.0f;
+
+        // --- Pitch shift ---
+        // Unvoiced input (consonants, silence) passes through unshifted.
+        float targetRatio = 1.0f;
+        if (smoothedPitchHz >= kMinPitchHz)
+        {
+            const float targetHz = 440.0f * std::pow (2.0f, static_cast<float> (voice.midiNote - 69) / 12.0f);
+            targetRatio = (targetHz / smoothedPitchHz) * std::pow (2.0f, detuneCents * spread / 1200.0f);
+        }
+        targetRatio = juce::jlimit (0.25f, 4.0f, targetRatio);
+
+        if (voice.needsInit) voice.ratio = targetRatio;
+        else                 voice.ratio += (targetRatio - voice.ratio) * ratioCoeff;
+
+        voice.shifter.setShiftRatio (voice.ratio);
+        voice.shifter.process (mono, pitched, numSamples);
+
+        // --- Pan / delay targets (smoothed so voices never jump when chords change) ---
+        const float pan = activeCount > 1 ? spread * width : 0.0f;
+        const float targetPanL = std::sqrt (0.5f * (1.0f - pan));
+        const float targetPanR = std::sqrt (0.5f * (1.0f + pan));
+        const float targetDelay = juce::jlimit (0.0f,
+                                                static_cast<float> (voice.delayLine.size()) - 4.0f,
+                                                maxDelaySamples * position * (activeCount > 1 ? 1.0f : 0.0f));
+
+        const float startL = voice.needsInit ? targetPanL  : voice.panL;
+        const float startR = voice.needsInit ? targetPanR  : voice.panR;
+        const float startD = voice.needsInit ? targetDelay : voice.delaySamples;
+        voice.needsInit = false;
+
+        const float endL = startL + (targetPanL  - startL) * panCoeff;
+        const float endR = startR + (targetPanR  - startR) * panCoeff;
+        const float endD = startD + (targetDelay - startD) * panCoeff;
+        const float stepL = (endL - startL) / n;
+        const float stepR = (endR - startR) / n;
+        const float stepD = (endD - startD) / n;
+        voice.panL = endL;
+        voice.panR = endR;
+        voice.delaySamples = endD;
+
+        // --- Delay line (fractional, interpolated), gain envelope, mix ---
         auto& dl = voice.delayLine;
         const int dlSize = static_cast<int> (dl.size());
-        int& wpos = voice.writePos;
+        int wpos = voice.writePos;
+        float gL = startL, gR = startR, dly = startD;
 
         for (int i = 0; i < numSamples; ++i)
         {
-            dl[static_cast<size_t> (wpos)] = src[i];
-            int rp = wpos - voice.delaySamples;
-            if (rp < 0) rp += dlSize;
-            const float delayed = dl[static_cast<size_t> (rp)];
-            wpos = (wpos + 1) % dlSize;
+            gL += stepL;  gR += stepR;  dly += stepD;
+
+            dl[static_cast<size_t> (wpos)] = pitched[i];
+
+            float rp = static_cast<float> (wpos) - dly;
+            if (rp < 0.0f) rp += static_cast<float> (dlSize);
+            int i0 = static_cast<int> (rp);
+            if (i0 >= dlSize) i0 -= dlSize;
+            const float frac = rp - static_cast<float> (i0);
+            int i1 = i0 + 1;
+            if (i1 >= dlSize) i1 = 0;
+
+            const float a = dl[static_cast<size_t> (i0)];
+            const float b = dl[static_cast<size_t> (i1)];
+            const float delayed = a + (b - a) * frac;
+
+            wpos = (wpos + 1 == dlSize) ? 0 : wpos + 1;
 
             voice.currentGain += (voice.targetGain - voice.currentGain) * smoothCoeff;
-            const float g = voice.currentGain * voiceGain;
+            const float g = voice.currentGain * ramp[i];
 
-            outL[i] += delayed * panL * g;
-            if (numChannels > 1) outR[i] += delayed * panR * g;
+            wl[i] += delayed * gL * g;
+            wr[i] += delayed * gR * g;
         }
+        voice.writePos = wpos;
 
-        if (voice.targetGain < 0.001f && voice.currentGain < 0.001f)
+        if (voice.targetGain < 0.001f && voice.currentGain < 0.001f)   // release finished
         {
             voice.currentGain = 0.0f;
             voice.midiNote    = -1;
         }
-        ++processedCount;
+        ++processed;
     }
 
-    const float dryAmount = 1.0f - dryWet;
-    if (dryAmount > 0.001f)
-        for (int ch = 0; ch < numChannels; ++ch)
-            buffer.addFrom (ch, 0, dry, ch, 0, numSamples, dryAmount);
+    // --- Final mix: time-aligned dry + wet voices ---
+    const float* mix = mixRamp.data();
+    constexpr float kMonoSum = 0.70710678f;
+
+    for (int i = 0; i < numSamples; ++i)
+    {
+        const float in0 = ch0[i];
+        const float in1 = stereoIn ? ch1[i] : in0;
+
+        const float d0 = dryDelay[0].process (in0);
+        const float d1 = dryDelay[1].process (in1);
+        const float m  = mix[i];
+
+        if (stereoOut)
+        {
+            ch0[i] = d0 * (1.0f - m) + wl[i] * m;
+            ch1[i] = d1 * (1.0f - m) + wr[i] * m;
+        }
+        else
+        {
+            const float dry = stereoIn ? 0.5f * (d0 + d1) : d0;
+            ch0[i] = dry * (1.0f - m) + (wl[i] + wr[i]) * kMonoSum * m;
+        }
+    }
 }
 
+// ============================================================
+// Editor / state
+// ============================================================
 juce::AudioProcessorEditor* VoiceMultiplierProcessor::createEditor()
 {
     return new VoiceMultiplierEditor (*this);

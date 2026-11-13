@@ -1,143 +1,6 @@
 #pragma once
 #include <JuceHeader.h>
-
-// ============================================================
-// SimplePitchShifter
-// ------------------------------------------------------------
-// Простой питч-шифтер на кольцевом буфере с двумя читающими
-// головками и кроссфейдом. Не даёт студийного качества, но
-// работает в реальном времени, не дрейфует и не требует
-// внешних зависимостей. Для гармонайзера этого достаточно.
-// ============================================================
-class SimplePitchShifter
-{
-public:
-    void prepare (double /*sampleRate*/, int maxBlockSize)
-    {
-        bufferSize = juce::jmax (maxBlockSize * 4, 4096);
-        buffer.assign (static_cast<size_t> (bufferSize), 0.0f);
-        writePos     = 0;
-        readPos      = static_cast<double> (bufferSize) * 0.75;
-        newReadPos   = static_cast<double> (bufferSize) * 0.25;
-        crossfadePos = -1.0;
-        ratio        = 1.0f;
-    }
-
-    void reset()
-    {
-        std::fill (buffer.begin(), buffer.end(), 0.0f);
-        writePos     = 0;
-        readPos      = static_cast<double> (bufferSize) * 0.75;
-        newReadPos   = static_cast<double> (bufferSize) * 0.25;
-        crossfadePos = -1.0;
-        ratio        = 1.0f;
-    }
-
-    void setShiftRatio (float newRatio)
-    {
-        ratio = juce::jlimit (0.25f, 4.0f, newRatio);
-    }
-
-    void process (juce::AudioBuffer<float>& block)
-    {
-        if (buffer.empty() || block.getNumChannels() < 1) return;
-
-        auto* data = block.getWritePointer (0);
-        const int n = block.getNumSamples();
-        const double bufSize = static_cast<double> (bufferSize);
-        const double minDelay = bufSize * 0.25;
-        const double crossfadeLen = juce::jmin (bufSize * 0.1, 512.0);
-
-        for (int i = 0; i < n; ++i)
-        {
-            buffer[static_cast<size_t> (writePos)] = data[i];
-            writePos = (writePos + 1) % bufferSize;
-
-            readPos += static_cast<double> (ratio);
-
-            // Distance from readPos to writePos (positive = reading past)
-            double dist = static_cast<double> (writePos) - readPos;
-            while (dist < 0.0)        dist += bufSize;
-            while (dist >= bufSize)   dist -= bufSize;
-
-            // Trigger crossfade when the read head is about to overtake
-            if (dist < minDelay && crossfadePos < 0.0)
-            {
-                crossfadePos = 0.0;
-                newReadPos   = readPos - bufSize * 0.5;
-            }
-
-            while (readPos >= bufSize) readPos -= bufSize;
-            while (readPos < 0.0)      readPos += bufSize;
-
-            const int   i0    = static_cast<int> (readPos);
-            const int   i1    = (i0 + 1) % bufferSize;
-            const float frac  = static_cast<float> (readPos - static_cast<double> (i0));
-            float sampleA = buffer[static_cast<size_t> (i0)] * (1.0f - frac)
-                          + buffer[static_cast<size_t> (i1)] * frac;
-
-            float outSample = sampleA;
-
-            if (crossfadePos >= 0.0)
-            {
-                const float cfGain = juce::jlimit (
-                    0.0f, 1.0f,
-                    static_cast<float> (crossfadePos / crossfadeLen));
-
-                while (newReadPos >= bufSize) newReadPos -= bufSize;
-                while (newReadPos < 0.0)      newReadPos += bufSize;
-
-                const int   ni0   = static_cast<int> (newReadPos);
-                const int   ni1   = (ni0 + 1) % bufferSize;
-                const float nfrac = static_cast<float> (newReadPos - static_cast<double> (ni0));
-                const float sampleB = buffer[static_cast<size_t> (ni0)] * (1.0f - nfrac)
-                                    + buffer[static_cast<size_t> (ni1)] * nfrac;
-
-                outSample = sampleA * (1.0f - cfGain) + sampleB * cfGain;
-
-                crossfadePos += 1.0;
-                newReadPos   += static_cast<double> (ratio);
-
-                if (crossfadePos >= crossfadeLen)
-                {
-                    readPos      = newReadPos;
-                    crossfadePos = -1.0;
-                }
-            }
-
-            data[i] = outSample;
-        }
-    }
-
-private:
-    std::vector<float> buffer;
-    int    bufferSize   = 4096;
-    int    writePos     = 0;
-    double readPos      = 0.0;
-    double newReadPos   = 0.0;
-    double crossfadePos = -1.0;
-    float  ratio        = 1.0f;
-};
-
-// ============================================================
-// YIN pitch detector
-// ============================================================
-class YinPitchDetector
-{
-public:
-    void prepare (double sampleRate, int minBufferSize);
-    void pushSamples (const float* data, int n);
-    float detect();
-    void reset();
-private:
-    std::vector<float> buffer, ordered, diff, diffNorm;
-    double sampleRate = 44100.0;
-    int bufferSize = 2048;
-    int writePos = 0;
-    int minPeriod = 44;
-    int maxPeriod = 1024;
-    float threshold = 0.15f;
-};
+#include "Dsp.h"
 
 // ============================================================
 // Main processor
@@ -145,6 +8,8 @@ private:
 class VoiceMultiplierProcessor : public juce::AudioProcessor
 {
 public:
+    static constexpr int kMaxVoices = 32;
+
     VoiceMultiplierProcessor();
     ~VoiceMultiplierProcessor() override = default;
 
@@ -173,36 +38,75 @@ public:
 
     juce::AudioProcessorValueTreeState apvts;
 
-    float getDetectedPitchHz() const { return detectedPitchHz.load(); }
+    // ---- Read-only state for the editor (thread-safe) ----
+    float getDetectedPitchHz() const noexcept   { return detectedPitchHz.load(); }
+    int   getActiveVoiceCount() const noexcept  { return activeVoiceCount.load(); }
+    bool  isNoteHeld (int note) const noexcept
+    {
+        if (note < 0 || note > 127) return false;
+        return (heldNotes[static_cast<size_t> (note >> 6)].load() >> (note & 63)) & 1u;
+    }
 
 private:
     juce::AudioProcessorValueTreeState::ParameterLayout createParameters();
 
-    static constexpr int kMaxVoices = 32;
+    void allocateScratch (int numSamples);
+    void updatePitchEstimate();
+    void handleMidi (const juce::MidiBuffer& midi, int maxVoices);
+    void setNoteHeld (int note, bool held) noexcept;
 
     struct VoiceSlot
     {
-        int   midiNote    = -1;
+        int   midiNote    = -1;      // -1 = slot is free
         float targetGain  = 0.0f;
         float currentGain = 0.0f;
-        std::unique_ptr<SimplePitchShifter> shifter;
-        std::vector<float> delayLine;
-        int   writePos     = 0;
-        int   delaySamples = 0;
+
+        // Smoothed per-voice parameters (snapped to their targets on the first block)
+        bool  needsInit    = true;
+        float ratio        = 1.0f;
+        float panL         = 0.7071f;
+        float panR         = 0.7071f;
+        float delaySamples = 0.0f;
+
+        vm::SimplePitchShifter shifter;
+        std::vector<float>     delayLine;
+        int                    writePos = 0;
     };
 
     std::array<VoiceSlot, kMaxVoices> voices;
-    YinPitchDetector pitchDetector;
+    vm::YinPitchDetector pitchDetector;
+    std::array<vm::SimpleDelay, 2> dryDelay;   // keeps the dry path aligned with the shifted voices
 
+    // Pitch tracking
     std::array<float, 5> pitchHistory { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-    int   pitchHistCount = 0;
-    int   pitchHistIdx   = 0;
-    float smoothedPitchHz = 0.0f;
+    int   pitchHistCount   = 0;
+    int   pitchHistIdx     = 0;
+    float smoothedPitchHz  = 0.0f;
+    int   unvoicedSamples  = 0;
+    int   pitchDetectCounter  = 0;
+    int   pitchDetectInterval = 512;
     std::atomic<float> detectedPitchHz { 0.0f };
 
+    // UI feedback
+    std::atomic<int> activeVoiceCount { 0 };
+    std::array<std::atomic<uint64_t>, 2> heldNotes;
+
+    // Pre-allocated scratch memory (no allocations on the audio thread)
+    std::vector<float> monoScratch, pitchedScratch, wetL, wetR, normRamp, mixRamp;
+    int scratchCapacity = 0;
+
+    // Global smoothed values
+    float smoothedNorm   = 1.0f;
+    float smoothedWetMix = 0.0f;
+
     double currentSampleRate = 44100.0;
-    int    pitchDetectCounter = 0;
-    static constexpr int kPitchDetectInterval = 512;
+
+    // Cached parameter pointers
+    std::atomic<float>* voicesParam = nullptr;
+    std::atomic<float>* detuneParam = nullptr;
+    std::atomic<float>* delayParam  = nullptr;
+    std::atomic<float>* widthParam  = nullptr;
+    std::atomic<float>* dryWetParam = nullptr;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (VoiceMultiplierProcessor)
 };
