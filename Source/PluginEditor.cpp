@@ -51,7 +51,7 @@ void VoiceMultiplierEditor::timerCallback()
     const float hz = processor.getDetectedPitchHz();
     if (hz > 20.0f && hz < 2000.0f)
     {
-        const int midiNote = (int) std::round (69.0 + 12.0 * std::log2 (hz / 440.0));
+        const int midiNote = static_cast<int> (std::round (69.0 + 12.0 * std::log2 (hz / 440.0)));
         static const char* names[] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
         const int octave = midiNote / 12 - 1;
         pitchLabel.setText ("Pitch: " + juce::String (names[(midiNote % 12 + 12) % 12])
@@ -79,7 +79,7 @@ void VoiceMultiplierEditor::resized()
     auto area = getLocalBounds().reduced (12);
     area.removeFromTop (24);
 
-    const int rowH = 30;
+    const int rowH   = 30;
     const int labelW = 130;
 
     auto layoutRow = [&] (juce::Label& l, juce::Slider& s)

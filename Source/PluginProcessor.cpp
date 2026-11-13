@@ -1,16 +1,20 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+// ============================================================
+// YIN pitch detector implementation
+// ============================================================
 void YinPitchDetector::prepare (double sr, int minSize)
 {
     sampleRate = sr;
     bufferSize = juce::jmax (2048, juce::nextPowerOfTwo (minSize));
-    buffer.assign  (bufferSize, 0.0f);
-    ordered.resize (bufferSize);
-    minPeriod = juce::jmax (2, (int) std::floor (sr / 1000.0));
-    maxPeriod = juce::jmin (bufferSize / 2 - 1, (int) std::ceil (sr / 60.0));
-    diff.resize     (maxPeriod + 2);
-    diffNorm.resize (maxPeriod + 2);
+    buffer.assign  (static_cast<size_t> (bufferSize), 0.0f);
+    ordered.resize (static_cast<size_t> (bufferSize));
+    minPeriod = juce::jmax (2, static_cast<int> (std::floor (sr / 1000.0)));
+    maxPeriod = juce::jmin (bufferSize / 2 - 1,
+                            static_cast<int> (std::ceil (sr / 60.0)));
+    diff.resize     (static_cast<size_t> (maxPeriod + 2));
+    diffNorm.resize (static_cast<size_t> (maxPeriod + 2));
     writePos = 0;
 }
 
@@ -18,7 +22,7 @@ void YinPitchDetector::pushSamples (const float* data, int n)
 {
     for (int i = 0; i < n; ++i)
     {
-        buffer[writePos] = data[i];
+        buffer[static_cast<size_t> (writePos)] = data[i];
         writePos = (writePos + 1) % bufferSize;
     }
 }
@@ -33,53 +37,65 @@ float YinPitchDetector::detect()
 {
     const int N = bufferSize;
     const int W = N / 2;
+
     for (int i = 0; i < N; ++i)
-        ordered[i] = buffer[(writePos + i) % N];
+        ordered[static_cast<size_t> (i)] =
+            buffer[static_cast<size_t> ((writePos + i) % N)];
 
     for (int tau = 1; tau <= maxPeriod; ++tau)
     {
         float sum = 0.0f;
         for (int j = 0; j < W; ++j)
         {
-            const float d = ordered[j] - ordered[j + tau];
+            const float d = ordered[static_cast<size_t> (j)]
+                          - ordered[static_cast<size_t> (j + tau)];
             sum += d * d;
         }
-        diff[tau] = sum;
+        diff[static_cast<size_t> (tau)] = sum;
     }
 
     diffNorm[0] = 1.0f;
     float running = 0.0f;
     for (int tau = 1; tau <= maxPeriod; ++tau)
     {
-        running += diff[tau];
-        diffNorm[tau] = running > 1e-10f ? (diff[tau] * tau / running) : 1.0f;
+        running += diff[static_cast<size_t> (tau)];
+        diffNorm[static_cast<size_t> (tau)] =
+            running > 1e-10f
+                ? (diff[static_cast<size_t> (tau)] * static_cast<float> (tau) / running)
+                : 1.0f;
     }
 
     int tauEst = -1;
     for (int tau = minPeriod; tau <= maxPeriod; ++tau)
     {
-        if (diffNorm[tau] < threshold)
+        if (diffNorm[static_cast<size_t> (tau)] < threshold)
         {
-            while (tau + 1 <= maxPeriod && diffNorm[tau + 1] < diffNorm[tau]) ++tau;
+            while (tau + 1 <= maxPeriod
+                   && diffNorm[static_cast<size_t> (tau + 1)]
+                      < diffNorm[static_cast<size_t> (tau)])
+                ++tau;
             tauEst = tau;
             break;
         }
     }
     if (tauEst < 0) return 0.0f;
 
-    float betterTau = (float) tauEst;
+    float betterTau = static_cast<float> (tauEst);
     if (tauEst > 0 && tauEst < maxPeriod)
     {
-        const float s0 = diffNorm[tauEst - 1];
-        const float s1 = diffNorm[tauEst];
-        const float s2 = diffNorm[tauEst + 1];
+        const float s0 = diffNorm[static_cast<size_t> (tauEst - 1)];
+        const float s1 = diffNorm[static_cast<size_t> (tauEst)];
+        const float s2 = diffNorm[static_cast<size_t> (tauEst + 1)];
         const float denom = 2.0f * (2.0f * s1 - s2 - s0);
         if (std::abs (denom) > 1e-10f)
-            betterTau = (float) tauEst + (s2 - s0) / denom;
+            betterTau = static_cast<float> (tauEst) + (s2 - s0) / denom;
     }
-    return (float) (sampleRate / betterTau);
+    return static_cast<float> (sampleRate / betterTau);
 }
 
+// ============================================================
+// Processor implementation
+// ============================================================
 VoiceMultiplierProcessor::VoiceMultiplierProcessor()
     : AudioProcessor (BusesProperties()
         .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
@@ -114,19 +130,14 @@ VoiceMultiplierProcessor::createParameters()
 void VoiceMultiplierProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     currentSampleRate = sampleRate;
-    const int delayLineSize = (int) (0.05 * sampleRate);
-
-    juce::dsp::ProcessSpec spec;
-    spec.sampleRate       = sampleRate;
-    spec.maximumBlockSize = (juce::uint32) samplesPerBlock;
-    spec.numChannels      = 1;
+    const int delayLineSize = static_cast<int> (0.05 * sampleRate);
 
     for (auto& v : voices)
     {
         v.shifter = std::make_unique<SimplePitchShifter>();
         v.shifter->prepare (sampleRate, samplesPerBlock);
         v.shifter->reset();
-        v.delayLine.assign (delayLineSize, 0.0f);
+        v.delayLine.assign (static_cast<size_t> (delayLineSize), 0.0f);
         v.writePos      = 0;
         v.midiNote      = -1;
         v.targetGain    = 0.0f;
@@ -160,12 +171,13 @@ void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     if (numChannels < 1) return;
 
     const int   maxVoices   = juce::jlimit (1, kMaxVoices,
-                                  (int) *apvts.getRawParameterValue ("voices"));
+                                  static_cast<int> (*apvts.getRawParameterValue ("voices")));
     const float detuneCents = apvts.getRawParameterValue ("detune")->load();
     const float maxDelayMs  = apvts.getRawParameterValue ("delay")->load();
     const float width       = apvts.getRawParameterValue ("width")->load();
     const float dryWet      = apvts.getRawParameterValue ("dryWet")->load();
 
+    // --- Mono input ---
     juce::AudioBuffer<float> monoIn (1, numSamples);
     {
         auto* m = monoIn.getWritePointer (0);
@@ -177,6 +189,7 @@ void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             for (int i = 0; i < numSamples; ++i) m[i] = L[i];
     }
 
+    // --- Pitch detection ---
     pitchDetector.pushSamples (monoIn.getReadPointer (0), numSamples);
     pitchDetectCounter += numSamples;
     if (pitchDetectCounter >= kPitchDetectInterval)
@@ -187,14 +200,14 @@ void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
         if (detected > 20.0f && detected < 2000.0f)
         {
-            pitchHistory[pitchHistIdx] = detected;
-            pitchHistIdx = (pitchHistIdx + 1) % (int) pitchHistory.size();
-            if (pitchHistCount < (int) pitchHistory.size()) ++pitchHistCount;
+            pitchHistory[static_cast<size_t> (pitchHistIdx)] = detected;
+            pitchHistIdx = (pitchHistIdx + 1) % static_cast<int> (pitchHistory.size());
+            if (pitchHistCount < static_cast<int> (pitchHistory.size())) ++pitchHistCount;
 
             std::array<float, 5> temp;
             std::copy (pitchHistory.begin(), pitchHistory.end(), temp.begin());
             std::sort (temp.begin(), temp.begin() + pitchHistCount);
-            smoothedPitchHz = temp[pitchHistCount / 2];
+            smoothedPitchHz = temp[static_cast<size_t> (pitchHistCount / 2)];
         }
         else
         {
@@ -202,6 +215,7 @@ void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         }
     }
 
+    // --- MIDI handling ---
     for (const auto meta : midiMessages)
     {
         const auto msg = meta.getMessage();
@@ -211,54 +225,63 @@ void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
             int existing = -1;
             for (int i = 0; i < kMaxVoices; ++i)
-                if (voices[i].midiNote == note) { existing = i; break; }
+                if (voices[static_cast<size_t> (i)].midiNote == note)
+                    { existing = i; break; }
 
             if (existing >= 0)
             {
-                voices[existing].targetGain = 1.0f;
+                voices[static_cast<size_t> (existing)].targetGain = 1.0f;
                 continue;
             }
 
             int activeCount = 0;
             for (int i = 0; i < kMaxVoices; ++i)
-                if (voices[i].midiNote >= 0) ++activeCount;
+                if (voices[static_cast<size_t> (i)].midiNote >= 0) ++activeCount;
 
             int slot = -1;
             if (activeCount < maxVoices)
                 for (int i = 0; i < kMaxVoices; ++i)
-                    if (voices[i].midiNote < 0) { slot = i; break; }
+                    if (voices[static_cast<size_t> (i)].midiNote < 0)
+                        { slot = i; break; }
 
-            if (slot < 0)
+            if (slot < 0)  // voice stealing
             {
                 float lowest = 2.0f;
                 for (int i = 0; i < kMaxVoices; ++i)
-                    if (voices[i].targetGain < 0.001f && voices[i].currentGain < lowest)
-                        { lowest = voices[i].currentGain; slot = i; }
+                {
+                    auto& v = voices[static_cast<size_t> (i)];
+                    if (v.targetGain < 0.001f && v.currentGain < lowest)
+                        { lowest = v.currentGain; slot = i; }
+                }
                 if (slot < 0)
                 {
                     lowest = 2.0f;
                     for (int i = 0; i < kMaxVoices; ++i)
-                        if (voices[i].currentGain < lowest)
-                            { lowest = voices[i].currentGain; slot = i; }
+                    {
+                        auto& v = voices[static_cast<size_t> (i)];
+                        if (v.currentGain < lowest)
+                            { lowest = v.currentGain; slot = i; }
+                    }
                 }
             }
 
             if (slot >= 0)
             {
-                voices[slot].midiNote    = note;
-                voices[slot].targetGain  = 1.0f;
-                voices[slot].currentGain = 0.0f;
-                voices[slot].shifter->reset();
-                std::fill (voices[slot].delayLine.begin(),
-                           voices[slot].delayLine.end(), 0.0f);
-                voices[slot].writePos = 0;
+                auto& v = voices[static_cast<size_t> (slot)];
+                v.midiNote    = note;
+                v.targetGain  = 1.0f;
+                v.currentGain = 0.0f;
+                v.shifter->reset();
+                std::fill (v.delayLine.begin(), v.delayLine.end(), 0.0f);
+                v.writePos = 0;
             }
         }
         else if (msg.isNoteOff())
         {
             const int note = msg.getNoteNumber();
             for (int i = 0; i < kMaxVoices; ++i)
-                if (voices[i].midiNote == note) voices[i].targetGain = 0.0f;
+                if (voices[static_cast<size_t> (i)].midiNote == note)
+                    voices[static_cast<size_t> (i)].targetGain = 0.0f;
         }
         else if (msg.isAllNotesOff() || msg.isAllSoundOff())
         {
@@ -268,7 +291,10 @@ void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
     int activeCount = 0;
     for (int i = 0; i < kMaxVoices; ++i)
-        if (voices[i].midiNote >= 0 || voices[i].currentGain > 0.001f) ++activeCount;
+    {
+        auto& v = voices[static_cast<size_t> (i)];
+        if (v.midiNote >= 0 || v.currentGain > 0.001f) ++activeCount;
+    }
 
     juce::AudioBuffer<float> dry;
     dry.makeCopyOf (buffer);
@@ -282,12 +308,12 @@ void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     }
 
     const float smoothCoeff = 1.0f - std::exp (-1.0f / (float) (currentSampleRate * 0.01));
-    const float voiceGain   = 1.0f / std::sqrt ((float) activeCount);
+    const float voiceGain   = 1.0f / std::sqrt (static_cast<float> (activeCount));
 
     int processedCount = 0;
     for (int v = 0; v < kMaxVoices; ++v)
     {
-        auto& voice = voices[v];
+        auto& voice = voices[static_cast<size_t> (v)];
         if (voice.midiNote < 0 && voice.currentGain < 0.001f) continue;
 
         const float targetHz = 440.0f * std::pow (2.0f, (voice.midiNote - 69) / 12.0f);
@@ -298,19 +324,18 @@ void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
         juce::AudioBuffer<float> pitched (1, numSamples);
         pitched.makeCopyOf (monoIn);
-        {
-            voice.shifter->process (pitched);
-        }
+        voice.shifter->process (pitched);
 
         const int targetDelay = (activeCount > 1)
-            ? (int) (maxDelayMs * 0.001 * currentSampleRate
-                     * (float) processedCount / (float) (activeCount - 1))
+            ? static_cast<int> (maxDelayMs * 0.001 * currentSampleRate
+                                * static_cast<float> (processedCount)
+                                / static_cast<float> (activeCount - 1))
             : 0;
         voice.delaySamples = targetDelay;
 
         const float pan = (activeCount <= 1) ? 0.0f
-            : juce::jmap ((float) processedCount, 0.0f,
-                          (float) (activeCount - 1), -width, width);
+            : juce::jmap (static_cast<float> (processedCount), 0.0f,
+                          static_cast<float> (activeCount - 1), -width, width);
         const float panL = std::sqrt (0.5f * (1.0f - pan));
         const float panR = std::sqrt (0.5f * (1.0f + pan));
 
@@ -318,15 +343,15 @@ void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         auto* outR = buffer.getWritePointer (numChannels > 1 ? 1 : 0);
         const auto* src = pitched.getReadPointer (0);
         auto& dl = voice.delayLine;
-        const int dlSize = (int) dl.size();
+        const int dlSize = static_cast<int> (dl.size());
         int& wpos = voice.writePos;
 
         for (int i = 0; i < numSamples; ++i)
         {
-            dl[wpos] = src[i];
+            dl[static_cast<size_t> (wpos)] = src[i];
             int rp = wpos - voice.delaySamples;
             if (rp < 0) rp += dlSize;
-            const float delayed = dl[rp];
+            const float delayed = dl[static_cast<size_t> (rp)];
             wpos = (wpos + 1) % dlSize;
 
             voice.currentGain += (voice.targetGain - voice.currentGain) * smoothCoeff;
@@ -367,4 +392,14 @@ void VoiceMultiplierProcessor::setStateInformation (const void* data, int sizeIn
     std::unique_ptr<juce::XmlElement> xmlState (getXmlFromBinary (data, sizeInBytes));
     if (xmlState != nullptr && xmlState->hasTagName (apvts.state.getType()))
         apvts.replaceState (juce::ValueTree::fromXml (*xmlState));
+}
+
+// ============================================================
+// Factory function - REQUIRED by JUCE to instantiate the plugin.
+// Without it, linking fails with "undefined reference to
+// 'createPluginFilter()'".
+// ============================================================
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new VoiceMultiplierProcessor();
 }

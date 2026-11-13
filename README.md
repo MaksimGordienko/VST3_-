@@ -22,5 +22,11 @@ VST3 MIDI-controlled vocal harmonizer.
 
 JUCE is pulled automatically via FetchContent (internet needed on first build).
 
+## Notes
+The built-in pitch shifter is a simple two-head crossfade delay-line.
+It works in real time but introduces a short latency (~30-50 ms) and
+some artifacts on rapid pitch changes. For studio-grade quality,
+consider integrating RubberBand or a PSOLA-based shifter later.
+
 ## CI
 GitHub Actions build - see .github/workflows/build.yml.

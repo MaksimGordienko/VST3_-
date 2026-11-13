@@ -13,6 +13,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(JUCE)
 
+# On CI we don't copy to the system VST3 folder
 if(DEFINED ENV{CI})
     set(COPY_VST3 FALSE)
 else()
@@ -32,6 +33,7 @@ juce_add_plugin(VoiceMultiplier
     FORMATS                   VST3
 )
 
+# REQUIRED: generates JuceHeader.h in the build directory
 juce_generate_juce_header(VoiceMultiplier)
 
 target_sources(VoiceMultiplier PRIVATE
@@ -44,6 +46,12 @@ target_compile_definitions(VoiceMultiplier PUBLIC
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
     JUCE_DISPLAY_SPLASH_SCREEN=0
+)
+
+# Silence noisy warnings from JUCE internals and our int->size_t casts
+target_compile_options(VoiceMultiplier PRIVATE
+    -Wno-sign-conversion
+    -Wno-array-bounds
 )
 
 target_link_libraries(VoiceMultiplier PRIVATE
