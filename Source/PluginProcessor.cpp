@@ -123,8 +123,8 @@ void VoiceMultiplierProcessor::prepareToPlay (double sampleRate, int samplesPerB
 
     for (auto& v : voices)
     {
-        v.shifter = std::make_unique<juce::dsp::PitchShifter<float>>();
-        v.shifter->prepare (spec);
+        v.shifter = std::make_unique<SimplePitchShifter>();
+        v.shifter->prepare (sampleRate, samplesPerBlock);
         v.shifter->reset();
         v.delayLine.assign (delayLineSize, 0.0f);
         v.writePos      = 0;
@@ -299,9 +299,7 @@ void VoiceMultiplierProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         juce::AudioBuffer<float> pitched (1, numSamples);
         pitched.makeCopyOf (monoIn);
         {
-            juce::dsp::AudioBlock<float> block (pitched);
-            juce::dsp::ProcessContextReplacing<float> ctx (block);
-            voice.shifter->process (ctx);
+            voice.shifter->process (pitched);
         }
 
         const int targetDelay = (activeCount > 1)

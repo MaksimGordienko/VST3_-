@@ -17,7 +17,71 @@ private:
     int maxPeriod = 1024;
     float threshold = 0.15f;
 };
+// PluginProcessor.h
+#pragma once
+#include <JuceHeader.h>
 
+// Простой питч-шифтер на основе кольцевого буфера с интерполяцией.
+// Не даёт студийного качества, но работает в реальном времени и не тянет
+// внешних зависимостей. Для гармонайзера этого достаточно.
+class SimplePitchShifter
+{
+public:
+    void prepare (double sampleRate, int maxBlockSize)
+    {
+        bufferSize = juce::jmax (maxBlockSize * 4, 4096);
+        buffer.assign (bufferSize, 0.0f);
+        writePos = 0;
+        readPos  = 0.0;
+        ratio    = 1.0;
+    }
+
+    void reset()
+    {
+        std::fill (buffer.begin(), buffer.end(), 0.0f);
+        writePos = 0;
+        readPos  = 0.0;
+        ratio    = 1.0;
+    }
+
+    void setShiftRatio (float newRatio)
+    {
+        ratio = juce::jlimit (0.25f, 4.0f, newRatio);
+    }
+
+    // Обрабатывает блок сэмплов in-place.
+    void process (juce::AudioBuffer<float>& block)
+    {
+        auto* data = block.getWritePointer (0);
+        const int n = block.getNumSamples();
+        const int bufSize = (int) buffer.size();
+
+        for (int i = 0; i < n; ++i)
+        {
+            // Пишем входной сэмпл в кольцевой буфер
+            buffer[writePos] = data[i];
+            writePos = (writePos + 1) % bufSize;
+
+            // Читаем с изменяемой скоростью
+            readPos += ratio;
+            while (readPos >= bufSize) readPos -= bufSize;
+            while (readPos < 0)        readPos += bufSize;
+
+            const int   i0   = (int) readPos;
+            const int   i1   = (i0 + 1) % bufSize;
+            const float frac = (float) (readPos - i0);
+
+            data[i] = buffer[i0] * (1.0f - frac) + buffer[i1] * frac;
+        }
+    }
+
+private:
+    std::vector<float> buffer;
+    int   bufferSize = 4096;
+    int   writePos   = 0;
+    double readPos   = 0.0;
+    float ratio      = 1.0f;
+};
 class VoiceMultiplierProcessor : public juce::AudioProcessor
 {
 public:
@@ -60,7 +124,7 @@ private:
         int   midiNote    = -1;
         float targetGain  = 0.0f;
         float currentGain = 0.0f;
-        std::unique_ptr<juce::dsp::PitchShifter<float>> shifter;
+        std::unique_ptr<SimplePitchShifter> shifter;
         std::vector<float> delayLine;
         int   writePos     = 0;
         int   delaySamples = 0;
