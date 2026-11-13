@@ -1,0 +1,10 @@
+build/
+build-*/
+.cache/
+compile_commands.json
+*.vst3
+*.component
+.DS_Store
+CMakeUserPresets.json
+.idea/
+.vscode/
