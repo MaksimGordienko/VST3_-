@@ -32,6 +32,8 @@ juce_add_plugin(VoiceMultiplier
     FORMATS                   VST3
 )
 
+juce_generate_juce_header(VoiceMultiplier)
+
 target_sources(VoiceMultiplier PRIVATE
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp
